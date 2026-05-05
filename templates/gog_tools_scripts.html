@@ -1,6 +1,22 @@
 // ── GOG ────────────────────────────────────────────────────────────────────
 
+let _gogSyncPollInterval = null;
 let _gogMetaPollInterval = null;
+
+function _gogSyncStatusText(d) {
+    if (d.phase === 'fetching_products') {
+        const pct = d.total_pages > 0 ? ` (page ${d.page}/${d.total_pages})` : '';
+        return `Fetching library list...${pct}`;
+    }
+    if (d.phase === 'processing') {
+        const game = d.current_game ? `: ${d.current_game}` : '';
+        const pct  = d.total > 0 ? ` (${d.done}/${d.total})` : '';
+        return `Adding games${pct}${game}`;
+    }
+    if (d.phase === 'stopped')   return 'Sync stopped';
+    if (d.phase === 'error')     return d.error || 'Sync failed';
+    return 'Syncing...';
+}
 
 function _gogMetaStatusText(d, prefix) {
     if (d.running) {
@@ -32,40 +48,89 @@ function _gogStartMetaPoll(st, onDone) {
     }, 1000);
 }
 
+function _gogSetSyncRunning(running) {
+    const btn = document.querySelector('button[onclick="gogSync()"]')
+             || document.querySelector('button[onclick="gogStopSync()"]');
+    if (!btn) return;
+    if (running) {
+        btn.textContent = 'Stop Sync';
+        btn.setAttribute('onclick', 'gogStopSync()');
+    } else {
+        btn.textContent = 'Sync Library';
+        btn.setAttribute('onclick', 'gogSync()');
+    }
+}
+
+async function gogStopSync() {
+    const st = document.getElementById('gog-manage-status-main');
+    if (st) { st.style.color = 'var(--text-secondary)'; st.textContent = 'Stopping...'; }
+    await fetch('/api/gog/sync/cancel', { method: 'POST' });
+}
+
 async function gogSync() {
     const st = document.getElementById('gog-manage-status-main');
     if (!st) return;
     st.style.color = 'var(--text-secondary)';
-    st.textContent = 'Syncing library...';
-    let newGames = 0, totalGames = 0, newDupes = 0;
+    st.textContent = 'Starting sync...';
     try {
         const r = await fetch('/api/gog/sync', { method: 'POST' });
         const d = await r.json();
-        if (d.status !== 'success') {
+        if (d.status === 'error') {
             st.style.color = 'var(--text-danger)';
             st.textContent = d.message || 'Sync failed';
             return;
         }
-        newGames   = d.new_games;
-        totalGames = d.total_games;
-        newDupes   = d.duplicates_detected || 0;
     } catch (e) {
         st.style.color = 'var(--text-danger)';
         st.textContent = 'Network error';
         return;
     }
+    _gogSetSyncRunning(true);
+    _gogStartSyncPoll(st);
+}
 
-    st.style.color = 'var(--text-secondary)';
-    st.textContent = `Library synced (${newGames} new). Fetching metadata...`;
-    const _jsonHdr = { 'Content-Type': 'application/json' };
-    await fetch('/api/gog/sync-metadata', { method: 'POST', headers: _jsonHdr, body: JSON.stringify({ force: false }) });
-    _gogStartMetaPoll(st, (d) => {
-        const parts = [`${newGames} new game${newGames !== 1 ? 's' : ''} (${totalGames} total)`, `${d.updated} metadata updated`];
-        if (d.deleted > 0) parts.push(`${d.deleted} non-game${d.deleted !== 1 ? 's' : ''} removed`);
-        if (newDupes > 0) parts.push(`${newDupes} duplicate${newDupes !== 1 ? 's' : ''} detected`);
-        st.textContent = `Done — ${parts.join(', ')}`;
-        if (newGames > 0 || d.updated > 0 || d.deleted > 0) setTimeout(() => location.reload(), 2000);
-    });
+function _gogStartSyncPoll(st) {
+    if (_gogSyncPollInterval) return;
+    _gogSyncPollInterval = setInterval(async () => {
+        try {
+            const r = await fetch('/api/gog/sync/status');
+            const d = await r.json();
+            if (st) {
+                st.style.color = d.phase === 'error' ? 'var(--text-danger)' : 'var(--text-secondary)';
+                st.textContent = _gogSyncStatusText(d);
+            }
+            if (d.phase === 'done' || d.phase === 'stopped' || d.phase === 'error') {
+                clearInterval(_gogSyncPollInterval);
+                _gogSyncPollInterval = null;
+                _gogSetSyncRunning(false);
+                if (d.phase === 'error') return;
+                const newGames = d.new_games || 0, totalGames = d.total_games || 0, newDupes = d.duplicates_detected || 0;
+                const stopped  = d.phase === 'stopped';
+                const parts    = [`${newGames} new game${newGames !== 1 ? 's' : ''} (${totalGames} total)`];
+                if (newDupes > 0) parts.push(`${newDupes} duplicate${newDupes !== 1 ? 's' : ''} detected`);
+                const prefix   = stopped ? 'Stopped' : 'Done';
+                if (st) { st.style.color = 'var(--accent-positive, #5c7e10)'; st.textContent = `${prefix} — ${parts.join(', ')}`; }
+                if (newGames > 0) setTimeout(() => location.reload(), 2000);
+            }
+        } catch (_) {}
+    }, 1000);
+}
+
+function _gogResumePolling() {
+    const st = document.getElementById('gog-manage-status-main');
+    fetch('/api/gog/sync/status')
+        .then(r => r.json())
+        .then(d => {
+            if (d.running) {
+                if (st) { st.style.color = 'var(--text-secondary)'; st.textContent = _gogSyncStatusText(d); }
+                _gogSetSyncRunning(true);
+                _gogStartSyncPoll(st);
+            }
+        }).catch(() => {});
+}
+
+if (typeof _manageOnOpen !== 'undefined') {
+    (_manageOnOpen['gog'] = _manageOnOpen['gog'] || []).push(_gogResumePolling);
 }
 
 async function gogSyncMetadata() {
@@ -86,22 +151,6 @@ function gogImportDates() {
     document.body.appendChild(a);
     a.click();
     a.remove();
-}
-
-async function gogDetectDuplicates() {
-    const st = document.getElementById('gog-manage-status-main');
-    if (st) st.textContent = 'Detecting duplicates…';
-    try {
-        const r = await fetch('/api/detect-duplicates', { method: 'POST' });
-        const d = await r.json();
-        if (st) {
-            st.textContent = d.status === 'ok'
-                ? `Done — ${d.detected} duplicate${d.detected !== 1 ? 's' : ''} detected`
-                : `Error: ${d.message}`;
-        }
-    } catch (e) {
-        if (st) st.textContent = `Error: ${e.message}`;
-    }
 }
 
 async function gogDisconnect() {

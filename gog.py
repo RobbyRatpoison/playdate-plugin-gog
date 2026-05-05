@@ -185,12 +185,72 @@ def get_galaxy_user_id():
 
 # ── Library sync ──────────────────────────────────────────────────────────────
 
-def _fetch_all_products(session):
-    """Fetch all owned GOG products across pages. Returns (products, errors)."""
+_sync_state = {
+    'running': False, 'phase': None,
+    'page': 0, 'total_pages': 0,
+    'done': 0, 'total': 0, 'current_game': '',
+    'new_games': 0, 'total_games': 0, 'duplicates_detected': 0, 'error': None,
+}
+_sync_lock   = threading.Lock()
+_sync_cancel = threading.Event()
+
+
+def get_sync_state():
+    with _sync_lock:
+        return dict(_sync_state)
+
+
+def start_library_sync():
+    """Start a background library sync. Returns {status: 'started'|'already_running'}."""
+    with _sync_lock:
+        if _sync_state['running']:
+            return {'status': 'already_running'}
+        _sync_cancel.clear()
+        _sync_state.update({
+            'running': True, 'phase': 'fetching_products', 'page': 0, 'total_pages': 0,
+            'done': 0, 'total': 0, 'current_game': '',
+            'new_games': 0, 'total_games': 0, 'duplicates_detected': 0, 'error': None,
+        })
+    threading.Thread(target=_run_sync_library, daemon=True).start()
+    return {'status': 'started'}
+
+
+def cancel_library_sync():
+    """Signal the running library sync to stop."""
+    _sync_cancel.set()
+
+
+def _run_sync_library():
+    try:
+        _do_sync_library()
+    except Exception as e:
+        log.error(f'GOG library sync thread: {e}', exc_info=True)
+        with _sync_lock:
+            _sync_state.update({'running': False, 'phase': 'error', 'error': str(e)})
+
+
+def _do_sync_library():
+    from database import get_db, add_to_blacklist, update_game_data as _update_game_data
+    from images import download_vertical, download_horizontal, download_icon, _sgdb_search_game_id
+    from datetime import datetime, timezone, date as _date
+
+    session        = get_valid_session()
+    galaxy_user_id = get_galaxy_user_id()
+    if not session:
+        with _sync_lock:
+            _sync_state.update({'running': False, 'phase': 'error',
+                                'error': 'Not connected to GOG — please reconnect'})
+        return
+
+    # Phase 1: fetch full product list
     products = []
-    errors   = []
     page     = 1
     while True:
+        if _sync_cancel.is_set():
+            with _sync_lock:
+                _sync_state.update({'running': False, 'phase': 'stopped',
+                                    'new_games': 0, 'total_games': 0})
+            return
         try:
             resp = session.get(
                 'https://embed.gog.com/account/getFilteredProducts',
@@ -198,72 +258,70 @@ def _fetch_all_products(session):
                 timeout=20,
             )
             if resp.status_code == 401:
-                return None, ['GOG session expired — please reconnect']
+                with _sync_lock:
+                    _sync_state.update({'running': False, 'phase': 'error',
+                                        'error': 'GOG session expired — please reconnect'})
+                return
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            errors.append(f'Page {page}: {e}')
+            log.warning(f'GOG library: page {page} fetch failed: {e}')
             break
+        total_pages = data.get('totalPages', 1)
         products.extend(data.get('products', []))
-        log.info(f'GOG library: page {page}/{data.get("totalPages", "?")} — {len(data.get("products", []))} products')
-        if page >= data.get('totalPages', 1):
+        log.info(f'GOG library: page {page}/{total_pages} — {len(data.get("products", []))} products')
+        with _sync_lock:
+            _sync_state.update({'page': page, 'total_pages': total_pages})
+        if page >= total_pages:
             break
         page += 1
         time.sleep(0.3)
-    return products, errors
 
+    games = [p for p in products if p.get('isGame') and not p.get('isMovie')]
+    log.info(f'GOG sync: {len(games)} games from {len(products)} products')
 
-def sync_library():
-    """
-    Fetch all owned GOG games and insert new ones into the DB.
-    Downloads art for new games via SGDB.
-    Returns {'new_games': int, 'total_games': int, 'errors': [str]}.
-    """
-    session = get_valid_session()
-    if not session:
-        return {'error': 'Not connected to GOG — please reconnect'}
-
-    all_products, errors = _fetch_all_products(session)
-    if all_products is None:
-        return {'error': errors[0]}
-
-    # Only real games, not movies or non-game products
-    games = [p for p in all_products if p.get('isGame') and not p.get('isMovie')]
-    log.info(f'GOG sync: {len(games)} games from {len(all_products)} products')
-
-    if not games:
-        return {'new_games': 0, 'total_games': 0, 'errors': errors}
-
-    from database import get_db
-    from datetime import datetime, timezone
-
+    # Phase 2: process each new game with metadata and art inline
     db = get_db()
     try:
         existing = {
-            row[0]
-            for row in db.execute(
+            row[0] for row in db.execute(
                 "SELECT platform_id FROM games WHERE platform = 'gog'"
             ).fetchall()
         }
         blacklisted = {
-            row[0]
-            for row in db.execute(
+            row[0] for row in db.execute(
                 "SELECT platform_id FROM blacklist WHERE platform_id IS NOT NULL"
             ).fetchall()
         }
 
-        new_games = []
-        today_ts  = int(datetime.now(timezone.utc).timestamp())
+        new_products = [p for p in games
+                        if str(p['id']) not in existing and str(p['id']) not in blacklisted]
+        total_new = len(new_products)
+        log.info(f'GOG sync: {total_new} new games to process (skipping {len(games) - total_new} existing)')
 
-        for p in games:
+        today_ts       = int(datetime.now(timezone.utc).timestamp())
+        today          = _date.today().isoformat()
+        new_games_count = 0
+
+        with _sync_lock:
+            _sync_state.update({'phase': 'processing', 'done': 0, 'total': total_new, 'current_game': ''})
+
+        for p in new_products:
+            if _sync_cancel.is_set():
+                with _sync_lock:
+                    _sync_state.update({'running': False, 'phase': 'stopped',
+                                        'new_games': new_games_count,
+                                        'total_games': len(games)})
+                return
+
             gog_id = str(p['id'])
-            if gog_id in existing or gog_id in blacklisted:
-                continue
+            name   = p.get('title', f'GOG Game {gog_id}')
+            slug   = p.get('slug', '')
+
+            with _sync_lock:
+                _sync_state['current_game'] = name
 
             next_appid = next_negative_appid(db)
-            name       = p.get('title', f'GOG Game {gog_id}')
-            slug       = p.get('slug', '')
-
             db.execute(
                 """INSERT OR IGNORE INTO games
                    (appid, name, platform, platform_id, platform_slug, date_added,
@@ -275,31 +333,70 @@ def sync_library():
                            '0', '0', '0', '0', '0')""",
                 (next_appid, name, gog_id, slug, today_ts),
             )
-            new_games.append({'appid': next_appid, 'name': name, 'slug': slug})
+            db.commit()
             log.info(f'GOG sync: added {name!r} as appid {next_appid}')
 
-        db.commit()
+            kept = True
+            meta = fetch_gog_metadata(gog_id)
+            if meta is not None:
+                category = meta.pop('_category', None)
+                if category is not None and category != 'GAME':
+                    db.execute('DELETE FROM games WHERE appid = ?', (next_appid,))
+                    db.commit()
+                    add_to_blacklist(next_appid, name, platform_id=gog_id)
+                    log.info(f'GOG sync: removed non-game {name!r} (category={category})')
+                    kept = False
+                else:
+                    meta['meta_fetched'] = today
+                    if session and galaxy_user_id:
+                        ach = fetch_gog_achievements(gog_id, galaxy_user_id, session)
+                        if ach is not None:
+                            meta.update(ach)
+                            meta['cheevos_fetched'] = today
+                    try:
+                        _update_game_data(next_appid, **meta)
+                    except Exception as e:
+                        log.warning(f'GOG metadata: DB update failed for {name!r}: {e}')
+
+            if kept:
+                try:
+                    sgdb_id = _sgdb_search_game_id(name)
+                    download_vertical(next_appid,   sgdb_id=sgdb_id)
+                    download_horizontal(next_appid, sgdb_id=sgdb_id)
+                    download_icon(next_appid, '',   sgdb_id=sgdb_id)
+                    _update_game_data(next_appid, art_fetched=today)
+                    log.info(f'GOG art: downloaded for {name!r} (appid {next_appid})')
+                except Exception as e:
+                    log.warning(f'GOG art: failed for {name!r}: {e}')
+                new_games_count += 1
+
+            with _sync_lock:
+                _sync_state['done'] += 1
+
+            time.sleep(0.3)
+
     finally:
         db.close()
 
-    # Download art for new games in the background
-    if new_games:
-        threading.Thread(
-            target=_fetch_art_for_games, args=(new_games,), daemon=True
-        ).start()
-
-    result = {
-        'new_games':   len(new_games),
-        'total_games': len(games),
-        'errors':      errors,
-    }
-
-    # Auto-detect duplicates for all unlinked GOG games (cheap DB scan, catches
-    # cases where a matching Steam game was added after the GOG sync ran)
     from database import auto_detect_duplicates
-    result['duplicates_detected'] = auto_detect_duplicates()
+    dupes = auto_detect_duplicates()
 
-    return result
+    with _sync_lock:
+        _sync_state.update({
+            'running': False, 'phase': 'done',
+            'new_games': new_games_count, 'total_games': len(games),
+            'duplicates_detected': dupes,
+        })
+
+
+def sync_library():
+    """Legacy synchronous wrapper — kept for internal callers."""
+    start_library_sync()
+    # Wait for completion (used only in non-interactive contexts)
+    import time as _time
+    while get_sync_state().get('running'):
+        _time.sleep(0.5)
+    return get_sync_state()
 
 
 
@@ -468,12 +565,14 @@ def sync_gog_metadata(force=False):
     try:
         if force:
             rows = db.execute(
-                "SELECT appid, platform_id, name FROM games WHERE platform = 'gog'"
+                "SELECT appid, platform_id, name, meta_fetched FROM games WHERE platform = 'gog'"
             ).fetchall()
         else:
             rows = db.execute(
-                "SELECT appid, platform_id, name FROM games "
-                "WHERE platform = 'gog' AND (meta_fetched IS NULL OR meta_fetched = '0')"
+                "SELECT appid, platform_id, name, meta_fetched FROM games "
+                "WHERE platform = 'gog'"
+                "  AND (meta_fetched IS NULL OR meta_fetched = '0'"
+                "       OR cheevos_fetched IS NULL OR cheevos_fetched = '0')"
             ).fetchall()
 
         updated = 0
@@ -489,9 +588,27 @@ def sync_gog_metadata(force=False):
 
         from database import add_to_blacklist
         for row in rows:
-            appid  = row['appid']
-            gog_id = row['platform_id']
-            name   = row['name']
+            appid           = row['appid']
+            gog_id          = row['platform_id']
+            name            = row['name']
+            has_meta        = row['meta_fetched'] and row['meta_fetched'] != '0'
+
+            if has_meta:
+                # Metadata already fetched — only missing achievements
+                if not (session and galaxy_user_id):
+                    time.sleep(0.5)
+                    continue
+                ach = fetch_gog_achievements(gog_id, galaxy_user_id, session)
+                if ach is not None:
+                    try:
+                        update_game_data(appid, cheevos_fetched=today, **ach)
+                        log.info(f'GOG metadata: fetched achievements for {name!r}')
+                        updated += 1
+                    except Exception as e:
+                        log.error(f'GOG metadata: achievement update failed for {name!r}: {e}')
+                        errors += 1
+                time.sleep(0.5)
+                continue
 
             meta = fetch_gog_metadata(gog_id)
             if meta is None:
