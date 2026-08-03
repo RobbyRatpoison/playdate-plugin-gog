@@ -10,8 +10,9 @@ import re
 import threading
 import time
 import zlib
+from datetime import datetime, timezone
 import requests
-from config import CONFIG_PATH, load_config, _save_config_data
+from config import load_config, _save_config_data
 from database import next_negative_appid
 from scrapers import _weighted_score
 from utils import review_score_label
@@ -361,10 +362,13 @@ def _do_sync_library():
             if kept:
                 try:
                     sgdb_id = _sgdb_search_game_id(name)
-                    download_vertical(next_appid,   sgdb_id=sgdb_id)
-                    download_horizontal(next_appid, sgdb_id=sgdb_id)
-                    download_icon(next_appid, '',   sgdb_id=sgdb_id)
-                    _update_game_data(next_appid, art_fetched=today)
+                    v_src   = download_vertical(next_appid,   sgdb_id=sgdb_id, game_name=name)
+                    h_src   = download_horizontal(next_appid, sgdb_id=sgdb_id, game_name=name)
+                    i_src   = download_icon(next_appid, '',   sgdb_id=sgdb_id, game_name=name)
+                    _update_game_data(next_appid, art_fetched=today,
+                                      vertical_art_source=v_src,
+                                      horizontal_art_source=h_src,
+                                      icon_source=i_src)
                     log.info(f'GOG art: downloaded for {name!r} (appid {next_appid})')
                 except Exception as e:
                     log.warning(f'GOG art: failed for {name!r}: {e}')
@@ -379,7 +383,8 @@ def _do_sync_library():
         db.close()
 
     from database import auto_detect_duplicates
-    dupes = auto_detect_duplicates()
+    from plugins import get_platform_priority
+    dupes = auto_detect_duplicates(platform_priority=get_platform_priority())
 
     with _sync_lock:
         _sync_state.update({
@@ -404,15 +409,21 @@ def sync_library():
 def _fetch_art_for_games(games):
     """Download SGDB art for a list of newly-added GOG games (runs in background)."""
     from images import download_vertical, download_horizontal, download_icon, _sgdb_search_game_id
+    from database import update_game_data
+    from datetime import date
 
     for g in games:
         appid = g['appid']
         name  = g['name']
         try:
             sgdb_id = _sgdb_search_game_id(name)
-            download_vertical(appid,   sgdb_id=sgdb_id)
-            download_horizontal(appid, sgdb_id=sgdb_id)
-            download_icon(appid, '',   sgdb_id=sgdb_id)
+            v_src   = download_vertical(appid,   sgdb_id=sgdb_id, game_name=name)
+            h_src   = download_horizontal(appid, sgdb_id=sgdb_id, game_name=name)
+            i_src   = download_icon(appid, '',   sgdb_id=sgdb_id, game_name=name)
+            update_game_data(appid, art_fetched=date.today().isoformat(),
+                             vertical_art_source=v_src,
+                             horizontal_art_source=h_src,
+                             icon_source=i_src)
             log.info(f'GOG art: downloaded for {name!r} (appid {appid})')
         except Exception as e:
             log.warning(f'GOG art: failed for {name!r}: {e}')
@@ -473,9 +484,26 @@ def fetch_gog_metadata(gog_id):
     if pub:
         result['publishers'] = pub
 
+    # games.release_date is INTEGER (Unix timestamp) -- this used to store
+    # str(release_date)[:10] (a "YYYY-MM-DD" string) directly, which SQLite's
+    # type affinity can't losslessly coerce into that column's storage class.
+    # A column with a mix of INTEGER (Steam) and TEXT (GOG) values sorts by
+    # storage class first (NULL < INTEGER/REAL < TEXT), not by date -- ORDER
+    # BY release_date grouped every GOG game before/after every Steam game
+    # instead of interleaving them by actual date.
     release_date = product.get('globalReleaseDate') or product.get('gogReleaseDate')
     if release_date:
-        result['release_date'] = str(release_date)[:10]
+        try:
+            dt = datetime.fromisoformat(str(release_date).replace('Z', '+00:00'))
+            # A date-only value (no offset/Z) parses as naive, and naive
+            # .timestamp() falls back to the local system timezone rather
+            # than UTC -- forced explicitly here to match date_to_ts() and
+            # every other plugin's date parsing in this codebase.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            result['release_date'] = int(dt.timestamp())
+        except ValueError:
+            pass
 
     # tags = official genre classifications (Role-playing, Action, Fantasy…)
     genre_list = [t['name'] for t in (emb.get('tags') or []) if t.get('name')]
@@ -500,7 +528,7 @@ def fetch_gog_metadata(gog_id):
             result['review_percentage']   = percent
             result['weighted_percentage'] = _weighted_score(percent, count)
             result['total_reviews']       = count
-            result['positive_reviews']    = round(p * count)
+            result['positive_reviews']    = round(percent / 100 * count)
             result['review_score']        = review_score_label(percent, count)
     except Exception as e:
         log.warning(f'GOG metadata: ratings fetch failed for {gog_id}: {e}')
@@ -528,6 +556,29 @@ def fetch_gog_achievements(gog_id, galaxy_user_id, session):
     except Exception as e:
         log.warning(f'GOG achievements: fetch failed for gog_id={gog_id}: {e}')
         return None
+
+
+def _fetch_all_products(session):
+    """Fetch every product (game or otherwise) in the user's GOG library, paginated.
+    Same endpoint/shape as _do_sync_library's Phase 1. Returns (products, total_pages)."""
+    products = []
+    page = 1
+    total_pages = 1
+    while True:
+        resp = session.get(
+            'https://embed.gog.com/account/getFilteredProducts',
+            params={'mediaType': 1, 'page': page},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        total_pages = data.get('totalPages', 1)
+        products.extend(data.get('products', []))
+        if page >= total_pages:
+            break
+        page += 1
+        time.sleep(0.3)
+    return products, total_pages
 
 
 def sync_gog_metadata(force=False):
@@ -593,7 +644,7 @@ def sync_gog_metadata(force=False):
             name            = row['name']
             has_meta        = row['meta_fetched'] and row['meta_fetched'] != '0'
 
-            if has_meta:
+            if has_meta and not force:
                 # Metadata already fetched — only missing achievements
                 if not (session and galaxy_user_id):
                     time.sleep(0.5)
@@ -799,15 +850,7 @@ def _get_builds(gog_id, os_name, session):
         return []
 
 
-def _find_gog_executable(install_path, product_id):
-    """
-    Parse goggame-{product_id}.info for the primary play task executable.
-    Returns a forward-slash relative path string, or None.
-
-    On Linux native builds the .info file may be absent or use a different
-    convention, so the fallback scans for any executable file in the install root.
-    """
-    # Look for the canonical file, then any goggame-*.info
+def _get_info_candidates(install_path, product_id):
     candidates = [os.path.join(install_path, f'goggame-{product_id}.info')]
     try:
         candidates += [
@@ -818,8 +861,101 @@ def _find_gog_executable(install_path, product_id):
         ]
     except Exception:
         pass
+    return candidates
 
-    for info_path in candidates:
+
+def _get_dosbox_launch(install_path, product_id):
+    """
+    If the game's primary play task runs DOSBox, return (dosbox_bin, args_list, cwd).
+    Returns False if this is not a DOSBox game, None if dosbox binary not found.
+
+    Conf file paths are returned as absolute paths.
+    cwd is set to the app/ subdirectory when present so that relative mount
+    paths in [autoexec] (e.g. "mount c ..") resolve to the install root.
+    """
+    import shlex, shutil
+
+    dosbox_task = None
+    for info_path in _get_info_candidates(install_path, product_id):
+        if not os.path.isfile(info_path):
+            continue
+        try:
+            with open(info_path, 'r', encoding='utf-8', errors='ignore') as f:
+                info = json.load(f)
+            tasks = sorted(info.get('playTasks', []),
+                           key=lambda t: (not t.get('isPrimary', False),))
+            for task in tasks:
+                if task.get('type') == 'FileTask':
+                    p = (task.get('path') or '').replace('\\', '/').lower()
+                    if 'dosbox' in os.path.basename(p) and p.endswith('.exe'):
+                        dosbox_task = task
+                        break
+        except Exception:
+            pass
+        if dosbox_task:
+            break
+
+    if not dosbox_task:
+        return False  # not a DOSBox game
+
+    dosbox_bin = None
+    for candidate in ('dosbox', 'dosbox-staging', 'dosbox-x', 'dosbox-svn'):
+        dosbox_bin = shutil.which(candidate)
+        if dosbox_bin:
+            break
+    if not dosbox_bin:
+        log.warning('_get_dosbox_launch: no dosbox binary found in PATH')
+        return None  # DOSBox game but binary not installed
+
+    raw_args = dosbox_task.get('arguments', '')
+    work_dir  = dosbox_task.get('workingDirectory', '').replace('\\', '/')
+    try:
+        parts = shlex.split(raw_args)
+    except Exception:
+        parts = raw_args.split()
+
+    # Search dirs for conf files: one level up from workingDir, then app/, then install root
+    search_dirs = []
+    if work_dir:
+        search_dirs.append(
+            os.path.normpath(os.path.join(install_path, work_dir, '..')))
+    search_dirs += [os.path.join(install_path, 'app'), install_path]
+
+    resolved = []
+    i = 0
+    while i < len(parts):
+        if parts[i].lower() == '-conf' and i + 1 < len(parts):
+            conf_name = os.path.basename(parts[i + 1].replace('\\', '/'))
+            found = None
+            for d in search_dirs:
+                c = os.path.join(d, conf_name)
+                if os.path.isfile(c):
+                    found = c  # absolute path
+                    break
+            if found:
+                resolved += ['-conf', found]
+            i += 2
+        else:
+            resolved.append(parts[i])
+            i += 1
+
+    # Run from app/ if it exists so "mount c .." in [autoexec] resolves to install root
+    app_dir = os.path.join(install_path, 'app')
+    cwd = app_dir if os.path.isdir(app_dir) else install_path
+
+    return dosbox_bin, resolved, cwd
+
+
+def _find_gog_executable(install_path, product_id):
+    """
+    Parse goggame-{product_id}.info for the primary play task executable.
+    Returns a forward-slash relative path string (or the system dosbox binary
+    path for DOSBox games), or None.
+
+    On Linux native builds the .info file may be absent or use a different
+    convention, so the fallback scans for any executable file in the install root.
+    """
+    for info_path in _get_info_candidates(install_path, product_id):
         if not os.path.isfile(info_path):
             continue
         try:
@@ -842,6 +978,16 @@ def _find_gog_executable(install_path, product_id):
                         combined = os.path.join(work_dir, path).replace('\\', '/').lstrip('/')
                         if os.path.isfile(os.path.join(install_path, combined)):
                             return combined
+                    # DOSBox game: the bundled dosbox.exe won't exist on Linux;
+                    # return the system binary so install code skips Proton setup.
+                    if ('dosbox' in os.path.basename(path).lower()
+                            and path.lower().endswith('.exe')):
+                        import shutil
+                        for _db in ('dosbox', 'dosbox-staging', 'dosbox-x', 'dosbox-svn'):
+                            _found = shutil.which(_db)
+                            if _found:
+                                return _found
+                        return None  # DOSBox game but no dosbox installed
         except Exception as e:
             log.warning(f'_find_gog_executable: {e}')
 
@@ -855,6 +1001,14 @@ def _find_gog_executable(install_path, product_id):
     SKIP_EXTENSIONS = {'.txt', '.md', '.cfg', '.ini', '.conf', '.json', '.log',
                        '.sh.bak', '.bak', '.orig', '.py', '.xml', '.html', '.htm',
                        '.css', '.js', '.desktop', '.png', '.jpg', '.svg', '.ico'}
+
+    def _is_elf(path):
+        try:
+            with open(path, 'rb') as _f:
+                return _f.read(4) == b'\x7fELF'
+        except Exception:
+            return False
+
     try:
         executables = []
         for entry in os.scandir(install_path):
@@ -862,7 +1016,7 @@ def _find_gog_executable(install_path, product_id):
                 _, ext = os.path.splitext(entry.name)
                 if ext.lower() in SKIP_EXTENSIONS:
                     continue
-                if os.access(entry.path, os.X_OK):
+                if os.access(entry.path, os.X_OK) or _is_elf(entry.path):
                     executables.append(entry.name)
         if executables:
             # Prefer known script-like extensions, then alphabetically first.
@@ -1065,7 +1219,9 @@ def install_game(appid, os_pref='auto', progress_cb=None, cancel_ev=None):
     wine_prefix         = None
 
     import platform as _plat
-    if chosen_os == 'windows' and platform_executable and _plat.system() != 'Windows':
+    _exe_lower = (platform_executable or '').lower()
+    _is_dosbox_exe = 'dosbox' in os.path.basename(_exe_lower) and not _exe_lower.endswith('.exe')
+    if chosen_os == 'windows' and platform_executable and _plat.system() != 'Windows' and not _is_dosbox_exe:
         # Linux host running a Windows GOG game — needs Proton
         from runners.proton import get_default_proton
         proton = get_default_proton()
@@ -1074,6 +1230,8 @@ def install_game(appid, os_pref='auto', progress_cb=None, cancel_ev=None):
         wine_prefix = os.path.join(install_path, 'prefix')
         os.makedirs(wine_prefix, exist_ok=True)
         log.info(f'GOG install: Windows game on Linux — Proton={runner_path!r}')
+    elif _is_dosbox_exe:
+        log.info(f'GOG install: DOSBox game — using system dosbox={platform_executable!r}')
     elif chosen_os == 'linux' and platform_executable:
         exe_abs = os.path.join(install_path, platform_executable)
         if os.path.isfile(exe_abs):
@@ -1207,22 +1365,56 @@ def launch_gog_game(appid):
                 'message': f'Cannot find executable for {game_name!r} — please set it manually'}
 
     import platform as _plat
-    import subprocess
     _host_win = _plat.system() == 'Windows'
     _is_exe   = platform_executable and platform_executable.lower().endswith('.exe')
 
     try:
-        if _is_exe and _host_win:
+        from runners.launch import check_launch, popen_checked
+        # DOSBox game: check .info regardless of what's stored in platform_executable,
+        # so games installed before this fix also launch correctly.
+        # _get_dosbox_launch returns: (bin, args) = found, None = not found, False = not a dosbox game
+        _dosbox = False
+        if not _host_win:
+            _dosbox = _get_dosbox_launch(install_path, row['platform_id'] or '')
+
+        if _dosbox is None:
+            return {'status': 'error',
+                    'message': (f'{game_name!r} requires DOSBox but no dosbox binary was found. '
+                                'Install dosbox or dosbox-staging.')}
+        elif _dosbox:
+            dosbox_bin, dosbox_args, dosbox_cwd = _dosbox
+            log.info(f'GOG launch (DOSBox): {dosbox_bin} {dosbox_args} (cwd={dosbox_cwd})')
+            _, err = popen_checked([dosbox_bin] + dosbox_args, cwd=dosbox_cwd)
+            if err:
+                log.error(f'GOG: {err["message"]}')
+                return err
+            proc = None
+        elif _is_exe and _host_win:
             # Windows host, Windows game — run the exe directly
             exe_abs = os.path.join(install_path, platform_executable.replace('/', os.sep))
-            proc = subprocess.Popen([exe_abs], cwd=install_path)
+            _, err = popen_checked([exe_abs], cwd=install_path)
+            if err:
+                log.error(f'GOG: {err["message"]}')
+                return err
+            proc = None
         elif _is_exe and not _host_win:
-            # Linux host, Windows game — use Proton
+            # Linux host, Windows game — Proton preferred, Wine fallback
             prefix = wine_prefix or os.path.join(install_path, 'prefix')
             os.makedirs(prefix, exist_ok=True)
-            from runners.proton import launch_game as _proton_launch
-            proc = _proton_launch(install_path, platform_executable, prefix,
-                                  proton_path=runner_path or None)
+            exe_abs = os.path.join(install_path, platform_executable.replace('/', os.sep))
+            from runners.proton import launch_game as _proton_launch, get_default_proton
+            _proton = get_default_proton()
+            if _proton:
+                proc = _proton_launch(install_path, platform_executable, prefix,
+                                      proton_path=runner_path or _proton['path'])
+            else:
+                log.info(f'GOG: no Proton found, falling back to Wine for {game_name!r}')
+                from runners.wine import run_in_prefix
+                proc = run_in_prefix(prefix_path=prefix, exe=exe_abs)
+            err = check_launch(proc)
+            if err:
+                log.error(f'GOG: {err["message"]}')
+                return err
         else:
             # Linux native (or macOS)
             exe_abs = os.path.join(install_path, platform_executable)
@@ -1230,9 +1422,14 @@ def launch_gog_game(appid):
                 return {'status': 'error', 'message': f'Executable not found: {exe_abs}'}
             if not _host_win:
                 os.chmod(exe_abs, 0o755)
-            proc = subprocess.Popen([exe_abs], cwd=install_path)
+            _, err = popen_checked([exe_abs], cwd=install_path)
+            if err:
+                log.error(f'GOG: {err["message"]}')
+                return err
+            proc = None
 
-        log.info(f'GOG launch: {game_name!r} (pid {proc.pid})')
+        if proc:
+            log.info(f'GOG launch: {game_name!r} (pid {proc.pid})')
 
         # Update last_played + completion_status
         now_ts = int(datetime.now(timezone.utc).timestamp())

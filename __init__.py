@@ -23,6 +23,10 @@ class GogPlugin:
         except Exception as e:
             log.warning(f"Startup GOG install sync failed: {e}")
 
+    def resync_installed(self):
+        from .watcher import sync_gog_install_status
+        sync_gog_install_status()
+
     def on_shutdown(self):
         from .watcher import stop_gog_watcher
         stop_gog_watcher()
@@ -34,7 +38,7 @@ class GogPlugin:
     date_import_url = 'https://www.gog.com/en/account/settings/orders?ref=playdate'
 
     def launch_game(self, appid):
-        from .gog import launch_gog_game, start_install, get_install_state
+        from .gog import launch_gog_game, start_install
         from database import get_db
         db = get_db()
         row = db.execute(
@@ -135,11 +139,9 @@ class GogPlugin:
                         'connected': [
                             {'type': 'connected_label'},
                             {'type': 'info_endpoint', 'endpoint': '/api/gog/proton-info'},
-                            {'type': 'buttons', 'items': [
-                                {'label': 'Sync Library', 'action': {'type': 'call', 'fn': 'gogSync'}},
-                                {'label': 'Import Purchase Dates', 'action': {'type': 'open_url', 'url': 'https://www.gog.com/en/account/settings/orders?ref=playdate'}},
-                                {'label': 'Disconnect', 'variant': 'muted', 'action': {'type': 'post', 'endpoint': '/api/gog/disconnect', 'on_success': 'refresh_auth'}},
-                            ]},
+                            {'type': 'button', 'label': 'Sync Library', 'action': {'type': 'call', 'fn': 'gogSync'}},
+                            {'type': 'button', 'label': 'Import Purchase Dates', 'action': {'type': 'open_url', 'url': 'https://www.gog.com/en/account/settings/orders?ref=playdate'}},
+                            {'type': 'button', 'label': 'Disconnect', 'variant': 'muted', 'action': {'type': 'post', 'endpoint': '/api/gog/disconnect', 'on_success': 'refresh_auth'}},
                             {'type': 'status_output', 'key': 'main'},
                         ],
                     },
