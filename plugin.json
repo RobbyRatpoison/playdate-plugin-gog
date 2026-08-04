@@ -1,7 +1,7 @@
 {
     "id": "gog",
     "name": "GOG",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "platform": "gog",
     "author": "RobbyRatpoison",
     "source": "github:RobbyRatpoison/playdate-plugin-gog",

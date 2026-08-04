@@ -341,10 +341,11 @@ def _do_sync_library():
             meta = fetch_gog_metadata(gog_id)
             if meta is not None:
                 category = meta.pop('_category', None)
-                if category is not None and category != 'GAME':
+                if (category is not None and category != 'GAME') or \
+                        (category == 'GAME' and _GOODIES_NAME_RE.search(name)):
                     db.execute('DELETE FROM games WHERE appid = ?', (next_appid,))
                     db.commit()
-                    add_to_blacklist(next_appid, name, platform_id=gog_id)
+                    add_to_blacklist(next_appid, name, platform_id=gog_id, platform='gog')
                     log.info(f'GOG sync: removed non-game {name!r} (category={category})')
                     kept = False
                 else:
@@ -435,6 +436,13 @@ def _fetch_art_for_games(games):
 _V2_GAMES_URL    = 'https://api.gog.com/v2/games/{gog_id}'
 _RATINGS_URL     = 'https://reviews.gog.com/v1/products/{gog_id}/averageRating'
 _ACHIEVEMENTS_URL = 'https://gameplay.gog.com/clients/{gog_id}/users/{galaxy_user_id}/achievements'
+
+# GOG sometimes tags bonus content (wallpapers, soundtracks, artbook bundles)
+# as category='GAME' in its own v2 catalog -- confirmed live against
+# "Cyberpunk 2077 Digital Goodies" -- so the category field alone isn't
+# reliable for this class of entry. Name-based fallback for the rest.
+# Deliberately excludes "secret santa" -- not treated as bonus content here.
+_GOODIES_NAME_RE = re.compile(r'\bgoodies?\s*(collection|pack)\b|\bdigital\s+goodies\b', re.I)
 
 
 def fetch_gog_metadata(gog_id):
@@ -675,17 +683,20 @@ def sync_gog_metadata(force=False):
             # Deletion logic:
             #   category=None (v2 404) + not in valid_gog_ids (url='') → non-game extra, delete
             #   category=None + in valid_gog_ids → free/delisted game with no v2 entry, keep
-            #   category='GAME' → real game, update metadata
+            #   category='GAME' + name matches goodies pattern → GOG mistags bonus content
+            #     as GAME (e.g. "Cyberpunk 2077 Digital Goodies"), delete anyway
+            #   category='GAME' otherwise → real game, update metadata
             #   category=anything else → DLC/pack/etc., delete
             category      = meta.pop('_category', None)
             has_store_url = (valid_gog_ids is None or str(gog_id) in valid_gog_ids)
             is_non_game   = (category is None and not has_store_url) or \
-                            (category is not None and category != 'GAME')
+                            (category is not None and category != 'GAME') or \
+                            (category == 'GAME' and _GOODIES_NAME_RE.search(name))
             if is_non_game:
                 try:
                     db.execute('DELETE FROM games WHERE appid = ?', (appid,))
                     db.commit()
-                    add_to_blacklist(appid, name, platform_id=gog_id)
+                    add_to_blacklist(appid, name, platform_id=gog_id, platform='gog')
                     log.info(f'GOG metadata: deleted + blacklisted non-game {name!r} (category={category})')
                     deleted += 1
                 except Exception as e:
