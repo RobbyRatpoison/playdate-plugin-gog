@@ -1123,8 +1123,9 @@ def install_game(appid, os_pref='auto', progress_cb=None, cancel_ev=None):
         log.warning(f'GOG install: meta manifest failed: {e}')
         return {'status': 'error', 'message': f'Meta manifest failed: {e}'}
 
+    from runners.installdir import get_install_dir
     install_dir  = meta.get('installDirectory') or re.sub(r'[^\w\s-]', '', game_name).strip()
-    install_path = os.path.join(GOG_INSTALL_BASE, install_dir)
+    install_path = os.path.join(get_install_dir('gog', GOG_INSTALL_BASE), install_dir)
     os.makedirs(install_path, exist_ok=True)
 
     # ── Collect files from all relevant depots ────────────────────────────────
@@ -1177,6 +1178,15 @@ def install_game(appid, os_pref='auto', progress_cb=None, cancel_ev=None):
     if not all_files:
         _cleanup_failed_install(install_path)
         return {'status': 'error', 'message': 'No files found in depot manifests', 'install_path': install_path}
+
+    try:
+        from runners.diskspace import check_disk_space
+        from runners.installdir import check_writable
+        check_writable(install_path)
+        check_disk_space(install_path, total_size)
+    except RuntimeError as e:
+        _cleanup_failed_install(install_path)
+        return {'status': 'error', 'message': str(e), 'install_path': install_path}
 
     # ── Download and write files ──────────────────────────────────────────────
     done_bytes = 0

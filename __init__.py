@@ -16,7 +16,8 @@ class GogPlugin:
     def on_startup(self):
         from .gog import GOG_INSTALL_BASE
         from .watcher import start_gog_watcher, sync_gog_install_status
-        start_gog_watcher(GOG_INSTALL_BASE)
+        from runners.installdir import get_install_dir
+        start_gog_watcher(get_install_dir('gog', GOG_INSTALL_BASE))
         try:
             sync_gog_install_status()
             log.info("GOG install status synced on startup")
@@ -145,6 +146,18 @@ class GogPlugin:
                             {'type': 'status_output', 'key': 'main'},
                         ],
                     },
+                },
+                {
+                    'title': 'Games Folder',
+                    'items': [
+                        {'type': 'text', 'content': 'Where PlayDate installs GOG games.'},
+                        {'type': 'info_endpoint', 'endpoint': '/api/gog/games-dir-info'},
+                        {'type': 'buttons', 'items': [
+                            {'label': 'Set Folder…', 'action': {'type': 'call', 'fn': 'gogPickFolder'}},
+                            {'label': 'Open Folder', 'action': {'type': 'call', 'fn': 'gogOpenFolder'}},
+                        ]},
+                        {'type': 'status_output', 'key': 'folder'},
+                    ],
                 },
             ],
         }

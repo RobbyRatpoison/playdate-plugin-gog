@@ -156,3 +156,60 @@ async function gogDisconnect() {
     await fetch('/api/gog/disconnect', { method: 'POST' });
     _manageRefreshAuth('gog');
 }
+
+// ── Games folder ─────────────────────────────────────────────────────────────
+
+var _gogFolderBusy = false;
+
+function gogPickFolder() {
+    if (_gogFolderBusy) return;
+    _gogFolderBusy = true;
+    setTimeout(function() { _gogFolderBusy = false; }, 300);
+    var statusEl = document.getElementById('gog-manage-status-folder');
+
+    function _pick() {
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_folder) {
+            return window.pywebview.api.pick_folder();
+        }
+        return Promise.resolve(null);
+    }
+
+    _pick().then(function(path) {
+        if (!path) return;
+        if (statusEl) statusEl.textContent = 'Saving…';
+        fetch('/api/gog/games-dir', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: path}),
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d.error) {
+                if (statusEl) statusEl.textContent = 'Error: ' + d.error;
+                return;
+            }
+            if (statusEl) statusEl.textContent = '';
+            _gogRefreshFolderInfo();
+        })
+        .catch(function(e) {
+            if (statusEl) statusEl.textContent = 'Error: ' + e.message;
+        });
+    });
+}
+
+function gogOpenFolder() {
+    fetch('/api/gog/open-folder', { method: 'POST' }).catch(function() {});
+}
+
+function _gogRefreshFolderInfo() {
+    fetch('/api/gog/games-dir-info')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            var el = document.getElementById('gog-manage-info-0');
+            if (el) el.textContent = d.text || '';
+        })
+        .catch(function() {});
+}
+
+if (!_manageOnOpen['gog']) _manageOnOpen['gog'] = [];
+_manageOnOpen['gog'].push(_gogRefreshFolderInfo);

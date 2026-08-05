@@ -249,3 +249,14 @@ def gog_proton_info():
         return jsonify({'text': '', 'color': ''})
 
 
+def _on_games_dir_change(path):
+    from .watcher import start_gog_watcher, stop_gog_watcher
+    stop_gog_watcher()
+    start_gog_watcher(path)
+
+
+from runners.installdir import register_install_dir_routes
+from .gog import GOG_INSTALL_BASE
+register_install_dir_routes(bp, 'gog', GOG_INSTALL_BASE, on_change=_on_games_dir_change)
+
+
