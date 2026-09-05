@@ -1021,6 +1021,7 @@ def _find_gog_executable(install_path, product_id):
             return False
 
     try:
+        from runners.native_exe import _native_rank
         executables = []
         for entry in os.scandir(install_path):
             if entry.is_file() and not entry.name.startswith('.'):
@@ -1036,7 +1037,14 @@ def _find_gog_executable(install_path, product_id):
                        if os.path.splitext(e)[1].lower() in script_exts]
             if scripts:
                 return sorted(scripts)[0]
-            return sorted(executables)[0]
+            # Rank by real bitness before falling back to alphabetical --
+            # a naive alphabetical sort picks a 32-bit `Foo.x86` over a
+            # 64-bit `Foo.x86_64` for the same game, and the 32-bit binary
+            # can't execute at all under the Flatpak build's 64-bit-only
+            # runtime. See runners.native_exe._native_rank / the same bug
+            # found and fixed in the itch.io/IndieGala/Humble plugins.
+            return sorted(executables,
+                          key=lambda e: (_native_rank(os.path.join(install_path, e)), e))[0]
     except Exception as e:
         log.warning(f'_find_gog_executable: generic scan failed: {e}')
 
