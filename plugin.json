@@ -1,7 +1,7 @@
 {
     "id": "gog",
     "name": "GOG",
-    "version": "1.1.4",
+    "version": "1.2.0",
     "min_core_version": "1.7.3",
     "platform": "gog",
     "author": "RobbyRatpoison",

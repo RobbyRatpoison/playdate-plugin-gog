@@ -56,6 +56,16 @@ class GogPlugin:
             'message':        f'Installing {game_name}…',
         }
 
+    art_kinds = ('vertical',)
+
+    def art_urls(self, appid):
+        from .gog import art_urls
+        from database import get_db
+        db = get_db()
+        row = db.execute("SELECT platform_id FROM games WHERE appid = ?", (appid,)).fetchone()
+        db.close()
+        return art_urls((row and row['platform_id']) or str(abs(appid)))
+
     def rescrape(self, appid):
         from datetime import datetime
         from .gog import fetch_gog_metadata, fetch_gog_achievements, get_valid_session, get_galaxy_user_id

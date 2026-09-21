@@ -407,6 +407,31 @@ def sync_library():
 
 
 
+_GOG_GAMESDB_URL = 'https://gamesdb.gog.com/platforms/gog/external_releases/{gog_id}'
+
+
+def art_urls(gog_id):
+    """GOG's own vertical cover for core's Artwork Sources "Store" option, from
+    the public (no login) GOG game database: {'vertical': url} or {} if it has
+    none. Only the vertical cover: GOG's wide "background" is title-less art
+    (worse than Steam/SGDB headers for a card) and its square icon is the same
+    image as the cover, so neither is offered."""
+    try:
+        resp = requests.get(_GOG_GAMESDB_URL.format(gog_id=gog_id), timeout=15)
+        if resp.status_code != 200:
+            log.warning(f'GOG art_urls: HTTP {resp.status_code} for {gog_id}')
+            return {}
+        cover = (resp.json().get('game') or {}).get('vertical_cover') or {}
+        fmt = cover.get('url_format') or ''
+    except Exception as e:
+        log.warning(f'GOG art_urls failed for {gog_id}: {e}')
+        return {}
+    if '{formatter}' not in fmt:
+        return {}
+    # '_glx_vertical_cover' is GOG's 342x482 cover size (the bare URL is a 171x241 thumbnail).
+    return {'vertical': fmt.replace('{formatter}', '_glx_vertical_cover').replace('{ext}', 'jpg')}
+
+
 def _fetch_art_for_games(games):
     """Download SGDB art for a list of newly-added GOG games (runs in background)."""
     from images import download_vertical, download_horizontal, download_icon, _sgdb_search_game_id
